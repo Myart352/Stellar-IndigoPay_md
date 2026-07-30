@@ -216,6 +216,80 @@ Verifier measures impact off-chain     ▼
 
 Unlike the automated pipeline (which flags for admin review), reaching the configured verifier threshold **auto-adjusts `co2_per_xlm` on-chain** to the median verified rate — no admin action required. The two mechanisms can run side by side: the automated pipeline catches statistically implausible rates at scale, while on-chain verifiers provide an auditable, adversarial-resistant check that doesn't depend on any single off-chain data source. See `contracts/indigopay-contract/SECURITY.md` for the trust model (who can become a verifier, how the deviation flag and threshold are administered).
 
+## Contract Architecture
+
+### Contract Composition
+
+Stellar-IndigoPay uses four Soroban contracts deployed on the Stellar network:
+
+| Contract              | Purpose                                                    | Storage Pattern       |
+| --------------------- | ---------------------------------------------------------- | --------------------- |
+| `indigopay-contract`  | Core donation tracking, project registry, governance, NFTs | Instance + Persistent |
+| `escrow-contract`     | Time-locked fund release for milestone-based projects      | Instance              |
+| `oracle-contract`     | USDC → XLM price feed (OracleInterface trait)              | Instance              |
+| `attestation-contract`| Off-chain verifier attestation registry                   | Instance              |
+
+### Storage Model
+
+- **Instance storage** (`env.storage().instance()`): Auto-lives with contract instance. Used for all core state (projects, donors, NFTs, governance, config). TTL extended via `ensure_min_ttl()` after every state-mutating call.
+- **Persistent storage** (`env.storage().persistent()`): Finite TTL per key. Used only by the donation module for `StealthDonation(u64)` and `ProjectDonations(Address)`. TTL extended on every read/write via the storage accessor layer.
+
+### Key Data Flows
+
+#### Donation Flow (XLM/USDC)
+```
+donor → Freighter signs tx → Horizon → contract.donate()
+  ├─ require_auth, not_paused checks
+  ├─ rate limit (sliding window per donor/project/token)
+  ├─ project verified & campaign accepts
+  ├─ token transfer (donor → project wallet + platform fee)
+  ├─ state updates: project.total_raised, donor_stats, global totals, NFTs
+  ├─ event emitted ("donated")
+  └─ ensure_min_ttl
+```
+
+#### Stealth Donation Flow
+```
+donor → Freighter signs tx → contract.donate_stealth()
+  ├─ generate stealth address from (project_wallet, ephemeral_pubkey)
+  ├─ transfer tokens to contract (custodied until claimed)
+  ├─ store StealthDonation (persistent), index in ProjectDonations (persistent)
+  └─ event emitted ("StealthDonation")
+```
+
+#### Batch Operations
+- `batch_donate`: processes up to N donations atomically, rate-limited per donor
+- `batch_register_projects`: admin registers multiple projects in one call
+- Each batch function calls `ensure_min_ttl` once at the end
+
+### Governance
+
+- **M-of-N admin**: Critical operations (upgrade, fee config, force-refund) require threshold signatures from the admin set
+- **Community voting**: Badge-holding donors can create/resolve verification proposals (quadratic voting)
+- **Delegation**: Donors may delegate voting weight to another address
+
+### Upgrade Mechanism
+
+Two-step: `propose_upgrade` (admin M-of-N) → 48h timelock → `execute_upgrade` (permissionless). Storage migrations run automatically after WASM swap.
+
+## Features (feature-gated)
+
+| Feature                | Cargo flag                | Description                                  |
+| ---------------------- | ------------------------- | -------------------------------------------- |
+| Donation module        | `donation`                | Stealth donations, off-chain escrow          |
+| USDC support           | `usdc`                    | Multi-currency via OracleInterface           |
+| Campaigns              | `campaign`                | Time-bound fundraising goals                 |
+| Platform fees          | `fees`                    | Configurable fee (0–5%) on donations         |
+| Community governance   | `governance`              | Proposal creation, voting                    |
+| Delegation             | `delegation`              | Vote weight delegation                       |
+| Impact NFTs            | `impact`                  | Merkle-tree impact certificates              |
+| Impact verification    | `impact_verification`     | Multi-verifier CO₂ rate auditing             |
+| Project verification   | `project_verification`    | Multi-verifier project due-diligence gate    |
+| zk-SNARK donations     | `zk`                      | Anonymous donations via Groth16 proofs       |
+| Refund                 | `refund`                  | Donor-initiated refund + M-of-N force-refund |
+| Upgrade                | `upgrade`                 | Two-step contract upgrade + migrations       |
+| Batch                  | `batch`                   | Batch donation processing                    |
+
 ## Security
 
 | Concern                 | Mitigation                                                 |
